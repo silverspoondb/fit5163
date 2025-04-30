@@ -26,6 +26,9 @@ class CertificateAuthority:
         else:
             self.certificate = self.parent.issue_certificate(self.name, self.public_key, is_ca=True)
 
+        print(f"\n=== {self.name} Initialize ===")
+        self.debug_certificate(self.certificate)
+
     def _generate_and_validate_keys(self):
         # generate RSA key pairs
         self._private_key = rsa.generate_private_key(
@@ -141,7 +144,7 @@ class CertificateAuthority:
         except Exception as e:
             raise RuntimeError(f"The certificate signature is invalid: {str(e)}") from e
 
-    # debug and validate
+    # validate
     def validate_certificate(self, cert):
 
         print(f"\n=== certificate {cert.serial_number} ===")
@@ -180,7 +183,16 @@ class CertificateAuthority:
         else:
             print("warning: attempt to revoke unissued certificates")
 
-
+    def debug_certificate(self, cert):
+        print(f"\n【certificate details】{cert.subject.rfc4514_string()}")
+        print(f"issuer: {cert.issuer.rfc4514_string()}")
+        print(f"serial_number: {cert.serial_number}")
+        print(f"validity period: {cert.not_valid_before_utc} to {cert.not_valid_after_utc}")
+        print(f"algorithm: {cert.signature_algorithm_oid._name}")
+        print(f"public key fingerprint: {cert.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).hex()[:16]}...")
 
 
 class Client:
@@ -241,7 +253,29 @@ class Client:
         }
 
 
+def verify_cert_chain(cert, issuer_ca):
+    print("\n=== certificate chain verification ===")
+    current_cert = cert
+    current_ca = issuer_ca
 
+    while current_ca is not None:
+        try:
+            current_ca.public_key.verify(
+                current_cert.signature,
+                current_cert.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                current_cert.signature_hash_algorithm,
+            )
+            print(f"v {current_ca.name} verification succeed -> {current_cert.subject.rfc4514_string()}")
+        except Exception as e:
+            print(f"x {current_ca.name} verification failed: {str(e)}")
+            return False
+
+        current_cert = current_ca.certificate
+        current_ca = current_ca.parent
+
+    print("v pass")
+    return True
 
 
 if __name__ == "__main__":
@@ -286,8 +320,16 @@ if __name__ == "__main__":
     # example
     if clients[0].certificate:
         print("\n=== test ===")
+
         print("verification result:", sub_ca1.validate_certificate(clients[0].certificate))
+        verify_cert_chain(clients[0].certificate, sub_ca1)
+
+        print("verification result:", sub_ca2.validate_certificate(clients[0].certificate))
+        verify_cert_chain(clients[0].certificate, sub_ca2)
+
+        print("verification result:", sub_ca2.validate_certificate(clients[2].certificate))
+        verify_cert_chain(clients[2].certificate, sub_ca2)
 
         print("\n=== revocation test ===")
         sub_ca1.revoke_certificate(clients[0].certificate.serial_number)
-        print("verification result  after revocation:", sub_ca1.validate_certificate(clients[0].certificate))
+        print("verification result after revocation:", sub_ca1.validate_certificate(clients[0].certificate))
