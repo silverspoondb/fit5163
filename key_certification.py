@@ -6,7 +6,7 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from datetime import datetime, timedelta, timezone
 import os
-
+import uuid
 
 class CertificateAuthority:
     def __init__(self, name, parent=None):
@@ -17,16 +17,19 @@ class CertificateAuthority:
         self.certificate = None
         self.issued_certs = {}
         self.revoked_certs = set()
+        self._initialize_ca()
 
-        # Initialize the key pair and verify.
+
+
+    def _initialize_ca(self):
+        """Initialize CA with key pair and certificate"""
         self._generate_and_validate_keys()
-
         if self.parent is None:
             self.certificate = self._generate_self_signed_cert()
         else:
-            self.certificate = self.parent.issue_certificate(self.name, self.public_key, is_ca=True)
-
-        print(f"\n=== {self.name} Initialize ===")
+            self.certificate = self.parent.issue_certificate(
+                self.name, self.public_key, is_ca=True)
+        print(f"\n[CA Initialized] {self.name} ready")
         self.debug_certificate(self.certificate)
 
     def _generate_and_validate_keys(self):
@@ -84,7 +87,7 @@ class CertificateAuthority:
         )
 
     def issue_certificate(self, subject_name, subject_pub_key, is_ca=False):
-        # Verify the validity of own key
+        # Validate the consistency of CA key
         self._validate_key_consistency()
 
         builder = (
@@ -111,7 +114,7 @@ class CertificateAuthority:
             )
 
         cert = builder.sign(self.private_key, hashes.SHA256(), default_backend())
-        # Verify the validity of the signature
+        # verify the validity of the signature
         self._verify_cert_signature(cert)
         self.issued_certs[cert.serial_number] = cert
         return cert
@@ -144,7 +147,7 @@ class CertificateAuthority:
         except Exception as e:
             raise RuntimeError(f"The certificate signature is invalid: {str(e)}") from e
 
-    # validate
+    # debug and validate
     def validate_certificate(self, cert):
 
         print(f"\n=== certificate {cert.serial_number} ===")
@@ -187,16 +190,69 @@ class CertificateAuthority:
         print(f"\n【certificate details】{cert.subject.rfc4514_string()}")
         print(f"issuer: {cert.issuer.rfc4514_string()}")
         print(f"serial_number: {cert.serial_number}")
-        print(f"validity period: {cert.not_valid_before_utc} to {cert.not_valid_after_utc}")
+        print(f"validity period: {cert.not_valid_before_utc} 至 {cert.not_valid_after_utc}")
         print(f"algorithm: {cert.signature_algorithm_oid._name}")
         print(f"public key fingerprint: {cert.public_key().public_bytes(
             encoding=serialization.Encoding.DER,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ).hex()[:16]}...")
 
+    def process_csr_request(self, encrypted_package):
+        """process encrypted CSR request"""
+        try:
+            # decrypt AES key
+            aes_key = self.private_key.decrypt(
+                encrypted_package['encrypted_aes_key'],
+                padding.OAEP(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+
+            # decrypt CSR data
+            cipher = Cipher(
+                algorithms.AES(aes_key),
+                modes.GCM(encrypted_package['iv'], encrypted_package['tag']),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+            csr_der = decryptor.update(encrypted_package['encrypted_csr']) + decryptor.finalize()
+
+            # load and validate CSR
+            csr = x509.load_der_x509_csr(csr_der, default_backend())
+            if not self._validate_csr(csr):
+                raise ValueError("CSR validation failed")
+
+            print(f"[CSR Processed] Request from {csr.subject.rfc4514_string()} verified")
+            return csr.public_key(), csr.subject
+        except Exception as e:
+            print(f"[CSR Error] {str(e)}")
+            return None, None
+
+    def _validate_csr(self, csr):
+        """validate CSR contents"""
+        # verify signature
+        try:
+            csr.public_key().verify(
+                csr.signature,
+                csr.tbs_certrequest_bytes,
+                padding.PKCS1v15(),
+                hashes.SHA256()
+            )
+        except:
+            raise ValueError("Invalid CSR signature")
+
+        # validate subject format
+        subject = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        if not subject or len(subject) != 1:
+            raise ValueError("Invalid subject name")
+
+        return True
 
 class Client:
     def __init__(self, name):
+        self.client_id = str(uuid.uuid4())  # 生成唯一客户端ID
         self.name = name
         self.private_key = rsa.generate_private_key(
             public_exponent=65537,
@@ -205,8 +261,19 @@ class Client:
         )
         self.public_key = self.private_key.public_key()
         self.certificate = None
-
         self._validate_key_pair()
+        self.print_client_info()
+
+    def print_client_info(self):
+        """Display client credentials"""
+        print(f"\n[Client Registered]")
+        print(f"Name: {self.name}")
+        print(f"ID  : {self.client_id}")
+        print("Public Key:")
+        print(self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode('utf-8'))
 
     def _validate_key_pair(self):
         test_msg = b"Client Key Validation"
@@ -226,16 +293,21 @@ class Client:
             raise RuntimeError("the client key pair is invalid") from e
 
     def generate_encrypted_csr(self, ca_public_key):
+        """Create encrypted certificate request"""
+        # Build CSR with client ID
         csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, self.name),
+            x509.NameAttribute(NameOID.USER_ID, self.client_id)
         ])).sign(self.private_key, hashes.SHA256(), default_backend())
 
+        # Hybrid encryption
         aes_key = os.urandom(32)
         iv = os.urandom(12)
         cipher = Cipher(algorithms.AES(aes_key), modes.GCM(iv), backend=default_backend())
         encryptor = cipher.encryptor()
         encrypted_csr = encryptor.update(csr.public_bytes(serialization.Encoding.DER)) + encryptor.finalize()
 
+        # Encrypt AES key
         encrypted_aes_key = ca_public_key.encrypt(
             aes_key,
             padding.OAEP(
@@ -252,6 +324,20 @@ class Client:
             'encrypted_csr': encrypted_csr
         }
 
+def interactive_client_registration():
+    """Handle client registration through CLI"""
+    clients = []
+    for i in range(3):
+        while True:
+            name = input(f"\nEnter client {i+1} name (q to quit): ").strip()
+            if name.lower() == 'q':
+                return None
+            if not name:
+                print("Name cannot be empty")
+                continue
+            clients.append(Client(name))
+            break
+    return clients
 
 def verify_cert_chain(cert, issuer_ca):
     print("\n=== certificate chain verification ===")
@@ -279,45 +365,43 @@ def verify_cert_chain(cert, issuer_ca):
 
 
 if __name__ == "__main__":
-    # CA
+    # Initialize PKI hierarchy
     root_ca = CertificateAuthority("Root CA")
     sub_ca1 = CertificateAuthority("Sub CA 1", parent=root_ca)
     sub_ca2 = CertificateAuthority("Sub CA 2", parent=root_ca)
 
-    clients = [Client("Client1"), Client("Client2"), Client("Client3")]
+    # Register clients
+    clients = interactive_client_registration()
+    if not clients:
+        exit
 
-    for i, client in enumerate(clients):
-        target_ca = sub_ca1 if i < 2 else sub_ca2
+    # Process each client
+    for idx, client in enumerate(clients):
+        # Assign to different sub CAs
+        target_ca = sub_ca1 if idx < 2 else sub_ca2
 
-        try:
-            csr_package = client.generate_encrypted_csr(target_ca.public_key)
+        print(f"\nProcessing {client.name} with {target_ca.name}")
+        encrypted_package = client.generate_encrypted_csr(target_ca.public_key)
 
-            aes_key = target_ca.private_key.decrypt(
-                csr_package['encrypted_aes_key'],
-                padding.OAEP(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
+        # Sub CA processes request
+        pub_key, subject = target_ca.process_csr_request(encrypted_package)
+
+        if pub_key and subject:
+            # Verify client ID
+            if subject.get_attributes_for_oid(NameOID.USER_ID)[0].value == client.client_id:
+                print("Client ID verified")
+
+                # Issue certificate
+                client.certificate = target_ca.issue_certificate(
+                    client.name,
+                    pub_key
                 )
-            )
+                print(f"Certificate issued for {client.name}")
+            else:
+                print("Warning: Client ID mismatch")
+        else:
+            print("Certificate issuance failed")
 
-            cipher = Cipher(
-                algorithms.AES(aes_key),
-                modes.GCM(csr_package['iv'], csr_package['tag']),
-                backend=default_backend()
-            )
-            decryptor = cipher.decryptor()
-            csr_der = decryptor.update(csr_package['encrypted_csr']) + decryptor.finalize()
-            csr = x509.load_der_x509_csr(csr_der, default_backend())
-            client.certificate = target_ca.issue_certificate(client.name, csr.public_key())
-            print(f"\n=== {client.name}  certificate issuance succeed ===")
-
-        except Exception as e:
-            print(f"{client.name} certificate issuance failed: {str(e)}")
-            continue
-
-
-    # example
     if clients[0].certificate:
         print("\n=== test ===")
 
